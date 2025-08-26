@@ -78,6 +78,7 @@ class OpenAIChat(Model):
     default_query: Optional[Any] = None
     http_client: Optional[httpx.Client] = None
     client_params: Optional[Dict[str, Any]] = None
+    is_reasoning: bool = False
 
     # The role to map the message role to.
     default_role_map = {
@@ -687,13 +688,30 @@ class OpenAIChat(Model):
             choice_delta: ChoiceDelta = response_delta.choices[0].delta
 
             if choice_delta:
-                # Add content
-                if choice_delta.content is not None:
-                    model_response.content = choice_delta.content
+                # --- Handle reasoning first ---
+                if getattr(choice_delta, "reasoning", None) or getattr(choice_delta, "reasoning_content", None):
+                    reasoning_text = getattr(choice_delta, "reasoning", None) or getattr(choice_delta, "reasoning_content", None)
 
-                # Add tool calls
-                if choice_delta.tool_calls is not None:
-                    model_response.tool_calls = choice_delta.tool_calls  # type: ignore
+                    if not getattr(model_response, "is_reasoning", False):
+                        # Start reasoning mode
+                        self.is_reasoning = True
+                        model_response.content = f"<think>{reasoning_text}"
+                    else:
+                        # Continue reasoning mode
+                        model_response.content = reasoning_text
+
+                # --- Handle normal content ---
+                elif choice_delta.content is not None:
+                    if getattr(model_response, "is_reasoning", False):
+                        # End reasoning mode before appending normal content
+                        model_response.content = f"</think>{choice_delta.content}"
+                        self.is_reasoning = False
+                    else:
+                        model_response.content = choice_delta.content
+
+            # --- Handle tool calls ---
+            if choice_delta.tool_calls is not None:
+                model_response.tool_calls = choice_delta.tool_calls  # type: ignore
 
                 # Add audio if present
                 if hasattr(choice_delta, "audio") and choice_delta.audio is not None:
