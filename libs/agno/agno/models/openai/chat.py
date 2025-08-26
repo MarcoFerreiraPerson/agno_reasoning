@@ -677,65 +677,88 @@ class OpenAIChat(Model):
         """
         Parse the OpenAI streaming response into a ModelResponse.
 
-        Args:
-            response_delta: Raw response chunk from OpenAI
-
-        Returns:
-            ModelResponse: Parsed response data
+        Behavior:
+        - If a reasoning field exists, ignore normal content for this delta.
+        - On the first reasoning delta, prepend "<think>" and set internal reasoning flag.
+        - While in reasoning mode, emit reasoning chunks without extra tags.
+        - When reasoning stops and a normal content chunk arrives, prepend "</think>" once and clear the flag.
         """
         model_response = ModelResponse()
-        if response_delta.choices and len(response_delta.choices) > 0:
-            choice_delta: ChoiceDelta = response_delta.choices[0].delta
 
-            if choice_delta:
-                # --- Handle reasoning first ---
-                if getattr(choice_delta, "reasoning", None) or getattr(choice_delta, "reasoning_content", None):
-                    reasoning_text = getattr(choice_delta, "reasoning", None) or getattr(choice_delta, "reasoning_content", None)
+        if not (response_delta.choices and len(response_delta.choices) > 0):
+            return model_response
 
-                    if not getattr(model_response, "is_reasoning", False):
-                        # Start reasoning mode
-                        self.is_reasoning = True
-                        model_response.content = f"<think>{reasoning_text}"
+        choice_delta: ChoiceDelta = response_delta.choices[0].delta
+        if not choice_delta:
+            return model_response
+
+        # helper: find any possible reasoning attribute names the provider might use
+        reasoning_text = None
+        for attr in ("reasoning", "reasoning_content", "reasoningContent"):
+            reasoning_text = getattr(choice_delta, attr, None)
+            if reasoning_text is not None:
+                break
+
+        # 1) Handle reasoning-first (if present, ignore normal content for this delta)
+        if reasoning_text is not None:
+            # start reasoning if we weren't already
+            if not getattr(self, "_is_reasoning", False):
+                self._is_reasoning = True
+                # avoid double-tagging if provider already included it
+                if isinstance(reasoning_text, str) and reasoning_text.startswith("<think>"):
+                    model_response.content = reasoning_text
+                else:
+                    model_response.content = f"<think>{reasoning_text}"
+                self.is_reasoning = True
+            else:
+                # already in reasoning mode -> emit chunk as-is (no extra tag)
+                model_response.content = reasoning_text
+                self.is_reasoning = True
+
+            # per your spec, when reasoning is present we do NOT process choice_delta.content
+            # (so we return after handling reasoning and tool_calls)
+        else:
+            # 2) No reasoning field — handle normal content
+            content_text = getattr(choice_delta, "content", None)
+            if content_text is not None:
+                if getattr(self, "_is_reasoning", False):
+                    # reasoning just ended; prepend the closing tag once
+                    self._is_reasoning = False
+                    if isinstance(content_text, str) and content_text.startswith("</think>"):
+                        model_response.content = content_text
                     else:
-                        # Continue reasoning mode
-                        model_response.content = reasoning_text
+                        model_response.content = f"</think>{content_text}"
+                    self.is_reasoning = False
+                else:
+                    model_response.content = content_text
 
-                # --- Handle normal content ---
-                elif choice_delta.content is not None:
-                    if getattr(model_response, "is_reasoning", False):
-                        # End reasoning mode before appending normal content
-                        model_response.content = f"</think>{choice_delta.content}"
-                        self.is_reasoning = False
+        # 3) Tool calls are independent of reasoning/content
+        if getattr(choice_delta, "tool_calls", None) is not None:
+            model_response.tool_calls = choice_delta.tool_calls  # type: ignore
+
+            # Add audio if present
+            if hasattr(choice_delta, "audio") and choice_delta.audio is not None:
+                try:
+                    if isinstance(choice_delta.audio, dict):
+                        model_response.audio = AudioResponse(
+                            id=choice_delta.audio.get("id"),
+                            content=choice_delta.audio.get("data"),
+                            expires_at=choice_delta.audio.get("expires_at"),
+                            transcript=choice_delta.audio.get("transcript"),
+                            sample_rate=24000,
+                            mime_type="pcm16",
+                        )
                     else:
-                        model_response.content = choice_delta.content
-
-            # --- Handle tool calls ---
-            if choice_delta.tool_calls is not None:
-                model_response.tool_calls = choice_delta.tool_calls  # type: ignore
-
-                # Add audio if present
-                if hasattr(choice_delta, "audio") and choice_delta.audio is not None:
-                    try:
-                        if isinstance(choice_delta.audio, dict):
-                            model_response.audio = AudioResponse(
-                                id=choice_delta.audio.get("id"),
-                                content=choice_delta.audio.get("data"),
-                                expires_at=choice_delta.audio.get("expires_at"),
-                                transcript=choice_delta.audio.get("transcript"),
-                                sample_rate=24000,
-                                mime_type="pcm16",
-                            )
-                        else:
-                            model_response.audio = AudioResponse(
-                                id=choice_delta.audio.id,
-                                content=choice_delta.audio.data,
-                                expires_at=choice_delta.audio.expires_at,
-                                transcript=choice_delta.audio.transcript,
-                                sample_rate=24000,
-                                mime_type="pcm16",
-                            )
-                    except Exception as e:
-                        log_warning(f"Error processing audio: {e}")
+                        model_response.audio = AudioResponse(
+                            id=choice_delta.audio.id,
+                            content=choice_delta.audio.data,
+                            expires_at=choice_delta.audio.expires_at,
+                            transcript=choice_delta.audio.transcript,
+                            sample_rate=24000,
+                            mime_type="pcm16",
+                        )
+                except Exception as e:
+                    log_warning(f"Error processing audio: {e}")
 
         # Add usage metrics if present
         if response_delta.usage is not None:
